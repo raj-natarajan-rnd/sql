@@ -48,27 +48,58 @@ FROM StatInfo
 GROUP BY SchemaName, TableName
 ORDER BY MIN(LastUpdated) ASC;   -- never-updated (NULL) and 2019 tables surface first
 ********
-/* ---- All database files: path, drive, size, growth ---- */
-SELECT
-    DB_NAME(mf.database_id)                                          AS DatabaseName,
-    mf.type_desc                                                     AS FileType,     -- ROWS = data, LOG, FILESTREAM
-    mf.name                                                          AS LogicalName,
-    mf.physical_name                                                 AS PhysicalPath,
-    vs.volume_mount_point                                            AS Drive,        -- NULL if DB offline
-    vs.logical_volume_name                                           AS VolumeLabel,
-    CAST(mf.size / 128.0 AS decimal(18,1))                           AS FileSizeMB,   -- size is in 8 KB pages
-    CASE mf.max_size
-         WHEN -1 THEN 'Unlimited'
-         WHEN  0 THEN 'No growth'
-         WHEN 268435456 THEN 'Unlimited (log)'
-         ELSE CAST(CAST(mf.max_size / 128.0 AS decimal(18,1)) AS varchar(20)) + ' MB'
-    END                                                             AS MaxSize,
-    CASE WHEN mf.is_percent_growth = 1
-         THEN CAST(mf.growth AS varchar(10)) + ' %'
-         ELSE CAST(CAST(mf.growth / 128.0 AS decimal(18,1)) AS varchar(20)) + ' MB'
-    END                                                             AS AutoGrowth,
-    CAST(vs.available_bytes / 1073741824.0 AS decimal(18,1))        AS DriveFreeGB,
-    CAST(vs.total_bytes     / 1073741824.0 AS decimal(18,1))        AS DriveTotalGB
-FROM sys.master_files AS mf
-OUTER APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs   -- OUTER so offline DBs still list
-ORDER BY DatabaseName, mf.type_desc, mf.file_id;
+SET NOCOUNT ON;
+IF OBJECT_ID('tempdb..#FileSpace') IS NOT NULL DROP TABLE #FileSpace;
+CREATE TABLE #FileSpace(
+    DatabaseName sysname, FileType nvarchar(60), LogicalName sysname,
+    PhysicalPath nvarchar(260), Drive nvarchar(260) NULL,
+    AllocatedMB decimal(18,1), UsedMB decimal(18,1),
+    FreeInFileMB decimal(18,1), FreeInFilePct decimal(5,1),
+    MaxSize varchar(24), AutoGrowth varchar(24),
+    DriveTotalGB decimal(18,1) NULL, DriveFreeGB decimal(18,1) NULL
+);
+
+DECLARE @db sysname, @sql nvarchar(max);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE state_desc = 'ONLINE'        -- only online databases
+      AND HAS_DBACCESS(name) = 1;      -- AND only ones this login can actually enter
+
+OPEN db_cur;
+FETCH NEXT FROM db_cur INTO @db;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @sql = N'USE ' + QUOTENAME(@db) + N';
+        INSERT INTO #FileSpace (DatabaseName, FileType, LogicalName, PhysicalPath, Drive,
+            AllocatedMB, UsedMB, FreeInFileMB, FreeInFilePct, MaxSize, AutoGrowth, DriveTotalGB, DriveFreeGB)
+        SELECT
+            DB_NAME(), df.type_desc, df.name, df.physical_name, vs.volume_mount_point,
+            CAST(df.size/128.0 AS decimal(18,1)),
+            CAST(FILEPROPERTY(df.name,''SpaceUsed'')/128.0 AS decimal(18,1)),
+            CAST((df.size - FILEPROPERTY(df.name,''SpaceUsed''))/128.0 AS decimal(18,1)),
+            CAST(100.0*(df.size - FILEPROPERTY(df.name,''SpaceUsed''))/NULLIF(df.size,0) AS decimal(5,1)),
+            CASE df.max_size WHEN -1 THEN ''Unlimited'' WHEN 0 THEN ''No growth''
+                 WHEN 268435456 THEN ''Unlimited''
+                 ELSE CAST(CAST(df.max_size/128.0 AS decimal(18,1)) AS varchar(20))+'' MB'' END,
+            CASE WHEN df.is_percent_growth=1 THEN CAST(df.growth AS varchar(10))+'' %''
+                 ELSE CAST(CAST(df.growth/128.0 AS decimal(18,1)) AS varchar(20))+'' MB'' END,
+            CAST(vs.total_bytes/1073741824.0 AS decimal(18,1)),
+            CAST(vs.available_bytes/1073741824.0 AS decimal(18,1))
+        FROM sys.database_files AS df
+        OUTER APPLY sys.dm_os_volume_stats(DB_ID(), df.file_id) AS vs;';
+        EXEC sys.sp_executesql @sql;
+    END TRY
+    BEGIN CATCH
+        PRINT 'Skipped ' + QUOTENAME(@db) + ': ' + ERROR_MESSAGE();   -- one bad DB no longer kills the run
+    END CATCH
+    FETCH NEXT FROM db_cur INTO @db;
+END
+CLOSE db_cur; DEALLOCATE db_cur;
+
+SELECT COUNT(*) AS RowsCollected FROM #FileSpace;   -- sanity check — should be > 0
+
+SELECT DatabaseName, FileType, LogicalName, PhysicalPath, Drive,
+       AllocatedMB, UsedMB, FreeInFileMB, FreeInFilePct, MaxSize, AutoGrowth, DriveFreeGB
+FROM #FileSpace
+ORDER BY DatabaseName, FileType, LogicalName;
