@@ -47,3 +47,28 @@ SELECT
 FROM StatInfo
 GROUP BY SchemaName, TableName
 ORDER BY MIN(LastUpdated) ASC;   -- never-updated (NULL) and 2019 tables surface first
+********
+/* ---- All database files: path, drive, size, growth ---- */
+SELECT
+    DB_NAME(mf.database_id)                                          AS DatabaseName,
+    mf.type_desc                                                     AS FileType,     -- ROWS = data, LOG, FILESTREAM
+    mf.name                                                          AS LogicalName,
+    mf.physical_name                                                 AS PhysicalPath,
+    vs.volume_mount_point                                            AS Drive,        -- NULL if DB offline
+    vs.logical_volume_name                                           AS VolumeLabel,
+    CAST(mf.size / 128.0 AS decimal(18,1))                           AS FileSizeMB,   -- size is in 8 KB pages
+    CASE mf.max_size
+         WHEN -1 THEN 'Unlimited'
+         WHEN  0 THEN 'No growth'
+         WHEN 268435456 THEN 'Unlimited (log)'
+         ELSE CAST(CAST(mf.max_size / 128.0 AS decimal(18,1)) AS varchar(20)) + ' MB'
+    END                                                             AS MaxSize,
+    CASE WHEN mf.is_percent_growth = 1
+         THEN CAST(mf.growth AS varchar(10)) + ' %'
+         ELSE CAST(CAST(mf.growth / 128.0 AS decimal(18,1)) AS varchar(20)) + ' MB'
+    END                                                             AS AutoGrowth,
+    CAST(vs.available_bytes / 1073741824.0 AS decimal(18,1))        AS DriveFreeGB,
+    CAST(vs.total_bytes     / 1073741824.0 AS decimal(18,1))        AS DriveTotalGB
+FROM sys.master_files AS mf
+OUTER APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs   -- OUTER so offline DBs still list
+ORDER BY DatabaseName, mf.type_desc, mf.file_id;
